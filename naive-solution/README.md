@@ -1,4 +1,4 @@
-# Rate Limit Handling - MOD solution (Naive Approach)
+# Rate Limit Handling - Counter Based solution (Naive Approach)
 
 ## What It Does
 
