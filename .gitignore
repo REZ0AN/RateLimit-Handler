@@ -7,3 +7,4 @@ __Pycache__/
 .DS_Store
 .idea/
 .vscode/
+.env
