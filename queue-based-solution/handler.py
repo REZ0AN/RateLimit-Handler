@@ -93,7 +93,7 @@ def parse_args():
     parser.add_argument("--max-calls",   type=int, default=15,      help="Client-side max calls per window (default: 15)")
     parser.add_argument("--window",      type=int, default=60,     help="Window in seconds (default: 60)")
     parser.add_argument("--max-retries", type=int, default=4,      help="Max retries on failure (default: 4)")
-    parser.add_argument("--requests",    type=int, default=14,     help="Total requests to simulate (default: 12)")
+    parser.add_argument("--requests",    type=int, default=20,     help="Total requests to simulate (default: 12)")
     return parser.parse_args()
 
 
