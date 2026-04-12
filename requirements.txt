@@ -1,2 +1,5 @@
 google-genai
-asyncio 
+asyncio
+asyncpg
+psycopg2-binary
+python-dotenv
