@@ -158,7 +158,8 @@ async def main():
 
     # enqueue inserts tasks as 'pending' and returns [{task_id, prompt}]
     # the coroutines themselves transition pending → running via mark_running()
-    tasks = await db.enqueue(prompts[:args.requests])
+    _prompts = [prompts[i%len(prompts)] for i in range(args.requests)]  # slice prompts to requested number
+    tasks = await db.enqueue(_prompts)
 
     logger(f"Starting {len(tasks)} tasks | limit: {args.max_calls} RPM")
     logger("-" * 60)

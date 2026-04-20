@@ -27,7 +27,8 @@ async def get_pool() -> asyncpg.Pool:
             os.environ["DATABASE_URL"],
             ssl="require",
             min_size=2,
-            max_size=30       # ← match your max concurrency (24 tasks + headroom)
+            max_size=30,
+            statement_cache_size=0,  # disable prepared statement caching to avoid "cached plan must
         )
     return _pool
 
