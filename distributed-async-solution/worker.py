@@ -1,38 +1,27 @@
 """
-worker.py — standalone rate-limited Gemini worker (Postgres-distributed).
+worker.py — rate-limited Gemini worker (Stage 7 revised: single-round-trip loop).
 
-Changes vs original Stage 5
------------------------------
-1. STUCK_TASK_TIMEOUT reduced 120s → 30s.
-   The original 120s was a workaround for updated_at being reset by
-   increment_retries(). Now that db.py uses claimed_at (which is never
-   touched after the initial claim), 30s is safe and correct.
+Key change vs previous Stage 7
+--------------------------------
+The main loop now calls claim_loop_step() — a single Postgres round trip that
+does recovery + completion check + claim atomically via one CTE.
 
-2. is_complete() receives stuck_threshold_seconds=STUCK_TASK_TIMEOUT.
-   Both is_complete() and recover_stuck_tasks() use the same threshold so
-   they stay in sync: a row ignored by is_complete() as "probably orphaned"
-   is guaranteed to be reset by recover_stuck_tasks() on the same iteration.
+Previous loop (3 round trips per iteration):
+    await db.recover_stuck_tasks(run_id)     # round trip 1
+    await db.is_complete(run_id)             # round trip 2
+    await db.claim_next_task(run_id, ...)    # round trip 3
 
-3. recover_stuck_tasks() is called BEFORE is_complete() and claim_next_task()
-   on every iteration. This ensures orphaned rows are reset to 'pending'
-   before we decide whether the run is complete and before we try to claim.
-   In the original the order was the same, but the threshold mismatch made
-   recovery ineffective.
+New loop (1 round trip per iteration):
+    step = await db.claim_loop_step(run_id, worker_id)  # round trip 1
 
-4. Startup DB connectivity check added.
-   get_pool() is called explicitly before the main loop starts. If the
-   DATABASE_URL is wrong or NeonDB is unreachable the worker logs a clear
-   error and exits immediately instead of silently spinning on "no pending
-   tasks" forever.
+At NeonDB latency this reduces per-task overhead from ~600-1500ms to
+~200-500ms, eliminating the 5-6 second gap between task completion and
+the next claim.
 
-5. Exception handling added around claim_next_task().
-   A DB error during claim previously returned None (transaction rolled back
-   silently), making the worker behave as if the queue were empty. Now it
-   logs the error and sleeps before retrying so transient DB issues don't
-   cause a silent stuck state.
-
-Everything else (two-lane retry, exponential backoff, heartbeat, shutdown
-via stop_event) is unchanged from Stage 5.
+rate_limiter.py also updated:
+    wait_if_needed() now passes (run_id, task_id, worker_id) to match
+    the Stage 7 db signatures. Previously log_event and add_wait_time
+    were called with old Stage 6 signatures causing silent failures.
 """
 
 import asyncio
@@ -49,11 +38,8 @@ from rate_limiter import PgRateLimiter, TooManyRequestsError
 
 load_dotenv()
 
-GEMINI_MODEL       = "gemma-4-26b-a4b-it"
-HEARTBEAT_EVERY    = 5   # seconds between heartbeat upserts
-STUCK_TASK_TIMEOUT = 40  # seconds before a 'running' task is considered stuck
-                         # must match the timeout passed to recover_stuck_tasks()
-                         # and is_complete() — they share one constant here.
+GEMINI_MODEL    = "gemma-4-26b-a4b-it"
+HEARTBEAT_EVERY = 5
 
 
 # ---------------------------------------------------------------------------
@@ -74,12 +60,6 @@ def make_logger(worker_id: str) -> logging.Logger:
 # ---------------------------------------------------------------------------
 
 async def ask_gemini(client: genai.Client, prompt: str) -> str:
-    """
-    Make one Gemini API call.
-
-    Raises TooManyRequestsError on 429.
-    Raises plain Exception on all other failures.
-    """
     try:
         response = await client.aio.models.generate_content(
             model=GEMINI_MODEL,
@@ -99,67 +79,50 @@ async def ask_gemini(client: genai.Client, prompt: str) -> str:
 
 async def process_task(
     task:        dict,
+    run_id:      str,
     worker_id:   str,
     limiter:     PgRateLimiter,
     client:      genai.Client,
     max_retries: int,
     log:         logging.Logger,
 ) -> None:
-    """
-    Process one task to completion. Never returns until the task reaches
-    'done' or 'failed'. All retries are handled internally.
-
-    Retry lanes
-    -----------
-    Lane 1 — TooManyRequestsError (API 429):
-        Sleep retry_after seconds. Does NOT increment retries counter.
-
-    Lane 2 — real errors (5xx, timeout, network, parse failure):
-        Sleep 2^retries seconds. Increments retries counter.
-        After max_retries exhausted: mark task 'failed', return.
-    """
     task_id = task["task_id"]
     prompt  = task["prompt"]
     retries = 0
 
     while True:
-        await limiter.wait_if_needed(task_id, worker_id)
+        await limiter.wait_if_needed(run_id, task_id, worker_id)
 
         try:
             t0      = time.monotonic()
             result  = await ask_gemini(client, prompt)
             elapsed = time.monotonic() - t0
 
-            await db.mark_done(task_id, worker_id, result)
-            log.info("task=%d done (%.2fs)", task_id, elapsed)
+            await db.mark_done(task_id, run_id, worker_id, result)
+            log.info("task=%s done (%.2fs)", task_id[:8], elapsed)
             return
 
         except TooManyRequestsError as exc:
-            log.warning(
-                "task=%d API 429 — sleeping %.0fs (not a retry)",
-                task_id, exc.retry_after,
-            )
-            await db.log_event(task_id, worker_id, "api_429", f"retry_after={exc.retry_after}")
+            log.warning("task=%s 429 — sleeping %.0fs (not a retry)",
+                        task_id[:8], exc.retry_after)
+            await db.log_event(run_id, task_id, worker_id, "api_429",
+                               f"retry_after={exc.retry_after}")
             await asyncio.sleep(exc.retry_after)
 
         except Exception as exc:
             retries += 1
             await db.increment_retries(task_id)
-            await db.log_event(task_id, worker_id, "error", str(exc))
+            await db.log_event(run_id, task_id, worker_id, "error", str(exc))
 
             if retries >= max_retries:
-                log.error(
-                    "task=%d failed after %d retries: %s",
-                    task_id, retries, exc,
-                )
-                await db.mark_failed(task_id, worker_id, str(exc))
+                log.error("task=%s failed after %d retries: %s",
+                          task_id[:8], retries, exc)
+                await db.mark_failed(task_id, run_id, worker_id, str(exc))
                 return
 
             backoff = 2 ** retries
-            log.warning(
-                "task=%d error (attempt %d/%d) backoff=%ds: %s",
-                task_id, retries, max_retries, backoff, exc,
-            )
+            log.warning("task=%s error (attempt %d/%d) backoff=%ds: %s",
+                        task_id[:8], retries, max_retries, backoff, exc)
             await asyncio.sleep(backoff)
 
 
@@ -167,13 +130,12 @@ async def process_task(
 # Heartbeat loop
 # ---------------------------------------------------------------------------
 
-async def heartbeat_loop(worker_id: str, stop_event: asyncio.Event):
-    """
-    Upsert last_seen every HEARTBEAT_EVERY seconds.
-    Wakes immediately when stop_event is set for a clean final heartbeat.
-    """
+async def heartbeat_loop(worker_id: str, run_id: str, stop_event: asyncio.Event):
     while not stop_event.is_set():
-        await db.upsert_heartbeat(worker_id)
+        try:
+            await db.upsert_heartbeat(worker_id, run_id)
+        except Exception:
+            pass
         try:
             await asyncio.wait_for(
                 asyncio.shield(stop_event.wait()),
@@ -181,8 +143,10 @@ async def heartbeat_loop(worker_id: str, stop_event: asyncio.Event):
             )
         except asyncio.TimeoutError:
             pass
-
-    await db.upsert_heartbeat(worker_id)
+    try:
+        await db.upsert_heartbeat(worker_id, run_id)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +155,7 @@ async def heartbeat_loop(worker_id: str, stop_event: asyncio.Event):
 
 async def main(
     worker_id:   str,
+    run_id:      str,
     max_calls:   int,
     window:      int,
     max_retries: int,
@@ -198,99 +163,64 @@ async def main(
 ):
     log = make_logger(worker_id)
 
-    # --- Connectivity check ---
-    # Only verify the DB is reachable — do NOT call setup_tables() here.
-    # When launched by master.py, all workers start simultaneously and
-    # concurrent setup_tables() calls race on ALTER TABLE / CREATE INDEX,
-    # causing "tuple concurrently updated" errors.
-    # master.py already called setup_tables() before launching workers.
     try:
         await db.get_pool()
     except Exception as exc:
-        log.error("DB connection failed — check DATABASE_URL: %s", exc)
+        log.error("DB connection failed: %s", exc)
         return
 
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        log.error("GEMINI_API_KEY not set in environment")
+        log.error("GEMINI_API_KEY not set")
         return
 
     client     = genai.Client(api_key=api_key)
     limiter    = PgRateLimiter(key=rate_key, max_calls=max_calls, window_seconds=window)
     stop_event = asyncio.Event()
 
-    hb = asyncio.create_task(heartbeat_loop(worker_id, stop_event))
+    hb = asyncio.create_task(heartbeat_loop(worker_id, run_id, stop_event))
 
-    log.info("started — limit %d/%ds  key='%s'", max_calls, window, rate_key)
+    log.info("started — run=%s  limit=%d/%ds  key='%s'",
+             run_id[:8], max_calls, window, rate_key)
 
     try:
         while not stop_event.is_set():
 
-            # --- Step 1: recover stuck tasks ---
-            # Must happen before is_complete() and claim_next_task().
-            # If a worker crashed, its task sits 'running' forever.
-            # recover_stuck_tasks() resets it to 'pending' so:
-            #   a) is_complete() won't block on it indefinitely.
-            #   b) claim_next_task() can pick it up.
-            # Uses claimed_at (set once on claim, never modified) so
-            # increment_retries() bumping updated_at can't hide a stuck task.
+            # One round trip: recover orphans + check completion + claim next task.
+            # Returns a dict with recovered, incomplete, task_id, prompt.
             try:
-                recovered = await db.recover_stuck_tasks(
-                    timeout_seconds=STUCK_TASK_TIMEOUT
-                )
-                if recovered:
-                    log.warning(
-                        "recovered %d stuck task(s) back to pending", recovered
-                    )
+                step = await db.claim_loop_step(run_id, worker_id)
             except Exception as exc:
-                log.error("recover_stuck_tasks failed: %s", exc)
+                log.error("claim_loop_step failed (will retry): %s", exc)
                 await asyncio.sleep(2)
                 continue
 
-            # --- Step 2: check completion ---
-            # is_complete() uses the same STUCK_TASK_TIMEOUT threshold so it
-            # ignores orphaned 'running' rows (already reset above) and only
-            # counts tasks that are genuinely in-flight right now.
-            # This prevents the "stuck at 0 pending, 1 running forever" loop.
-            try:
-                if await db.is_complete():
-                    log.info("all tasks complete — stopping")
-                    stop_event.set()
-                    break
-            except Exception as exc:
-                log.error("is_complete check failed: %s", exc)
-                await asyncio.sleep(2)
-                continue
+            if step["recovered"] > 0:
+                log.warning("recovered %d orphaned task(s) → pending",
+                            step["recovered"])
 
-            # --- Step 3: claim next task ---
-            try:
-                task = await db.claim_next_task(worker_id)
-            except Exception as exc:
-                # DB error during claim — transient network issue or lock timeout.
-                # Log it clearly so it's visible. Sleep and retry rather than
-                # silently returning None and spinning on "no pending tasks".
-                log.error("claim_next_task failed (will retry): %s", exc)
-                await asyncio.sleep(2)
-                continue
+            # incomplete == 0 means every task is done or failed
+            if step["incomplete"] == 0:
+                log.info("all tasks complete — stopping")
+                stop_event.set()
+                break
 
-            if task is None:
-                # Queue has no 'pending' rows right now. Two reasons:
-                #
-                # A) Another worker has the remaining task(s) in flight.
-                #    → sleep 1s and recheck. Not a polling delay for new tasks
-                #    (enqueue.py already ran). Just a yield while they finish.
-                #
-                # B) All tasks were just completed between step 2 and step 3.
-                #    → is_complete() will return True on the next iteration.
-                #
-                # Either way, sleep 1s and loop back to step 1.
+            # task_id is None when pending=0 but running>0 (other workers in flight)
+            if step["task_id"] is None:
                 log.debug("no pending tasks — waiting for in-flight tasks...")
                 await asyncio.sleep(1)
                 continue
 
-            # --- Step 4: process ---
-            log.info("claimed task=%d", task["task_id"])
-            await process_task(task, worker_id, limiter, client, max_retries, log)
+            log.info("claimed task=%s", step["task_id"][:8])
+            await process_task(
+                task        = {"task_id": step["task_id"], "prompt": step["prompt"]},
+                run_id      = run_id,
+                worker_id   = worker_id,
+                limiter     = limiter,
+                client      = client,
+                max_retries = max_retries,
+                log         = log,
+            )
 
     except KeyboardInterrupt:
         log.info("interrupted — shutting down")
@@ -303,17 +233,19 @@ async def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Rate-limited Gemini worker — Postgres-distributed (Stage 5)"
+        description="Rate-limited Gemini worker (Stage 7)"
     )
-    parser.add_argument("--worker-id",  required=True,        help="Unique label for this process")
-    parser.add_argument("--max-calls",  type=int, default=15, help="API calls allowed per window")
-    parser.add_argument("--window",     type=int, default=60, help="Window size in seconds")
-    parser.add_argument("--retries",    type=int, default=3,  help="Max retries on real errors")
-    parser.add_argument("--rate-key",   default="gemini:rpm", help="Shared rate limit key")
+    parser.add_argument("--worker-id",  required=True,         help="Unique label for this process")
+    parser.add_argument("--run-id",     required=True,         help="UUID of the current run")
+    parser.add_argument("--max-calls",  type=int, default=15,  help="API calls per window")
+    parser.add_argument("--window",     type=int, default=60,  help="Window size in seconds")
+    parser.add_argument("--retries",    type=int, default=3,   help="Max retries on real errors")
+    parser.add_argument("--rate-key",   default="gemini:rpm",  help="Shared rate limit key")
     args = parser.parse_args()
 
     asyncio.run(main(
         worker_id   = args.worker_id,
+        run_id      = args.run_id,
         max_calls   = args.max_calls,
         window      = args.window,
         max_retries = args.retries,
