@@ -1,7 +1,0 @@
-google-genai
-asyncio
-asyncpg
-psycopg2-binary
-python-dotenv
-streamlit
-pandas
